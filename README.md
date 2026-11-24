@@ -1,3 +1,1999 @@
+[Unit]
+Description=Master-Hub Data Pipeline Ingestion and Backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Master-Hub
+Environment=ENCRYPT_BACKUP=1
+ExecStart=/bin/bash -c 'set -euo pipefail; if [ -f data/incoming.jsonl ]; then python3 scripts/pipeline_ingest.py --input data/incoming.jsonl; fi; python3 scripts/hash_manifest.py generate --root . --output MANIFEST.sha256; bash scripts/backup_all.sh . "$HOME/backups"'
+[Unit]
+Description=Master-Hub Data Pipeline Ingestion and Backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Master-Hub
+Environment=ENCRYPT_BACKUP=1
+ExecStart=/bin/bash -c 'set -euo pipefail; if [ -f data/incoming.jsonl ]; then python3 scripts/pipeline_ingest.py --input data/incoming.jsonl; fi; python3 scripts/hash_manifest.py generate --root . --output MANIFEST.sha256; bash scripts/backup_all.sh . "$HOME/backups"'
+#!/usr/bin/env python3
+import argparse
+import csv
+import hashlib
+import json
+import sqlite3
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+HISTOGRAM_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0)
+
+
+def canonical_record_hash(record: dict[str, Any]) -> str:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def load_records(input_path: Path) -> list[dict[str, Any]]:
+    suffix = input_path.suffix.lower()
+    if suffix == ".csv":
+        with input_path.open("r", encoding="utf-8", newline="") as f:
+            return [dict(row) for row in csv.DictReader(f)]
+    if suffix in {".jsonl", ".ndjson"}:
+        records: list[dict[str, Any]] = []
+        for line in input_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+        return records
+    raise ValueError(f"Unsupported input format: {input_path.suffix}")
+
+
+def to_ocsf_event(
+    item: dict[str, Any],
+    batch_id: str,
+    ingested_at: str,
+    epoch_ms: int,
+    rec_hash: str,
+) -> dict[str, Any]:
+    severity_raw = str(item.get("severity", item.get("status", "info"))).lower()
+    if severity_raw in {"crit", "critical", "error", "err", "fail", "failed"}:
+        severity_id, severity = 4, "High"
+    elif severity_raw in {"warn", "warning"}:
+        severity_id, severity = 2, "Low"
+    else:
+        severity_id, severity = 1, "Informational"
+
+    return {
+        "class_uid": 6003,
+        "class_name": "API Activity",
+        "category_uid": 6,
+        "category_name": "Application Activity",
+        "severity_id": severity_id,
+        "severity": severity,
+        "time": epoch_ms,
+        "metadata": {
+            "version": "1.3.0",
+            "product": {"name": "Master-Hub", "vendor_name": "Local-First"},
+            "batch_id": batch_id,
+            "ingested_at": ingested_at,
+            "record_hash": rec_hash,
+        },
+        "observables": [{"name": "record_hash", "type_id": 10, "value": rec_hash}],
+        "data": item,
+    }
+
+
+def init_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            ingested_at TEXT NOT NULL,
+            record_hash TEXT NOT NULL UNIQUE,
+            ocsf_class_uid INTEGER NOT NULL,
+            severity_id INTEGER NOT NULL,
+            payload_json TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def format_openmetrics(
+    inserted: int,
+    duplicates: int,
+    duration_sec: float,
+) -> str:
+    lines = [
+        "# HELP master_pipeline_records_total Total records processed in batch",
+        "# TYPE master_pipeline_records_total counter",
+        f'master_pipeline_records_total{{status="inserted"}} {inserted}',
+        f'master_pipeline_records_total{{status="duplicate"}} {duplicates}',
+        "# HELP master_pipeline_batch_duration_seconds Batch processing duration in seconds",
+        "# TYPE master_pipeline_batch_duration_seconds histogram",
+    ]
+    for bound in HISTOGRAM_BUCKETS:
+        count = 1 if duration_sec <= bound else 0
+        lines.append(
+            f'master_pipeline_batch_duration_seconds_bucket{{le="{bound}"}} {count}'
+        )
+    lines.append(f'master_pipeline_batch_duration_seconds_bucket{{le="+Inf"}} 1')
+    lines.append(f"master_pipeline_batch_duration_seconds_sum {duration_sec:.6f}")
+    lines.append("master_pipeline_batch_duration_seconds_count 1")
+    lines.append("# EOF")
+    return "\n".join(lines) + "\n"
+
+
+def run_pipeline(
+    input_path: Path,
+    db_path: Path,
+    jsonl_out: Path,
+    metrics_out: Path,
+) -> dict[str, Any]:
+    start = time.perf_counter()
+    now_dt = datetime.now(timezone.utc)
+    batch_id = now_dt.strftime("%Y%m%dT%H%M%SZ")
+    ingested_at = now_dt.isoformat()
+    epoch_ms = int(now_dt.timestamp() * 1000)
+
+    raw_records = load_records(input_path)
+    conn = init_db(db_path)
+
+    inserted = 0
+    duplicates = 0
+    normalized_lines: list[str] = []
+
+    try:
+        with conn:
+            for item in raw_records:
+                rec_hash = canonical_record_hash(item)
+                event = to_ocsf_event(item, batch_id, ingested_at, epoch_ms, rec_hash)
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO pipeline_events
+                        (batch_id, ingested_at, record_hash, ocsf_class_uid, severity_id, payload_json)
+                    VALUES (?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        batch_id,
+                        ingested_at,
+                        rec_hash,
+                        event["class_uid"],
+                        event["severity_id"],
+                        json.dumps(event, sort_keys=True),
+                    ),
+                )
+                if cur.rowcount == 1:
+                    inserted += 1
+                    normalized_lines.append(json.dumps(event, sort_keys=True))
+                else:
+                    duplicates += 1
+    finally:
+        conn.close()
+
+    jsonl_out.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_out.write_text(
+        "\n".join(normalized_lines) + ("\n" if normalized_lines else ""),
+        encoding="utf-8",
+    )
+
+    elapsed = time.perf_counter() - start
+    metrics_out.parent.mkdir(parents=True, exist_ok=True)
+    metrics_out.write_text(
+        format_openmetrics(inserted, duplicates, elapsed),
+        encoding="utf-8",
+    )
+
+    return {
+        "total_input": len(raw_records),
+        "inserted": inserted,
+        "duplicates": duplicates,
+        "duration_seconds": round(elapsed, 6),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="OCSF-normalized local data pipeline ingester")
+    parser.add_argument("--input", type=Path, required=True, help="Input .csv or .jsonl file")
+    parser.add_argument("--db", type=Path, default=Path("data/pipeline.sqlite"))
+    parser.add_argument("--jsonl-out", type=Path, default=Path("data/normalized.jsonl"))
+    parser.add_argument("--metrics-out", type=Path, default=Path("data/metrics.prom"))
+    args = parser.parse_args()
+
+    stats = run_pipeline(args.input, args.db, args.jsonl_out, args.metrics_out)
+    print(json.dumps(stats, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+[Unit]
+Description=Master-Hub Data Pipeline Ingestion and Backup
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Master-Hub
+Environment=ENCRYPT_BACKUP=1
+ExecStart=/bin/bash -c 'set -euo pipefail; if [ -f data/incoming.jsonl ]; then python3 scripts/pipeline_ingest.py --input data/incoming.jsonl; fi; python3 scripts/hash_manifest.py generate --root . --output MANIFEST.sha256; bash scripts/backup_all.sh . "$HOME/backups"'
+name: Master Pipeline CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  pipeline-and-security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies & run pytest
+        run: |
+          python -m pip install --upgrade pip pytest cryptography
+          PYTHONPATH=. pytest -v
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build & test integrity-cli
+        working-directory: crates/integrity-cli
+        run: cargo test --locked || cargo test
+from pathlib import Path
+
+from scripts.hash_manifest import generate, verify
+from scripts.pipeline_ingest import run_pipeline
+from scripts.vault_encrypt import decrypt_file, encrypt_file
+
+
+def test_pipeline_dedup_and_outputs(tmp_path: Path) -> None:
+    csv_file = tmp_path / "events.csv"
+    csv_file.write_text("event_id,status\n1,ok\n1,ok\n2,warn\n", encoding="utf-8")
+
+    db_file = tmp_path / "pipeline.sqlite"
+    jsonl_file = tmp_path / "out.jsonl"
+    metrics_file = tmp_path / "metrics.prom"
+
+    stats = run_pipeline(csv_file, db_file, jsonl_file, metrics_file)
+    assert stats["total_input"] == 3
+    assert stats["inserted"] == 2
+    assert stats["duplicates"] == 1
+    assert db_file.exists()
+    assert jsonl_file.exists()
+    assert "master_pipeline_records_total" in metrics_file.read_text(encoding="utf-8")
+
+
+def test_manifest_and_vault_roundtrip(tmp_path: Path) -> None:
+    sample = tmp_path / "payload.txt"
+    sample.write_text("pipeline-state\n", encoding="utf-8")
+    manifest = tmp_path / "MANIFEST.sha256"
+
+    generate(tmp_path, manifest)
+    assert verify(tmp_path, manifest) == 0
+
+    enc = tmp_path / "payload.enc"
+    dec = tmp_path / "restored.txt"
+    encrypt_file(sample, enc, "test-passphrase")
+    decrypt_file(enc, dec, "test-passphrase")
+    assert dec.read_text(encoding="utf-8") == "pipeline-state\n"
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::env;
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+fn hash_file(path: &Path) -> Result<String, std::io::Error> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn scan_dir(root: &Path) -> Result<BTreeMap<String, String>, std::io::Error> {
+    let mut map = BTreeMap::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
+        if entry.file_type().is_file() {
+            let path: PathBuf = entry.path().to_path_buf();
+            if path.components().any(|c| {
+                let s = c.as_os_str();
+                s == ".git" || s == "target" || s == "__pycache__" || s == "data"
+            }) {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            map.insert(rel, hash_file(&path)?);
+        }
+    }
+    Ok(map)
+}
+
+fn main() {
+    let mut args = env::args().skip(1);
+    let cmd = args.next().unwrap_or_else(|| "scan".to_string());
+    let root = PathBuf::from(args.next().unwrap_or_else(|| ".".to_string()));
+
+    match cmd.as_str() {
+        "scan" => {
+            let entries = scan_dir(&root).expect("failed scanning directory");
+            for (rel, digest) in entries {
+                println!("{digest}  {rel}");
+            }
+        }
+        "check" => {
+            let manifest_path =
+                PathBuf::from(args.next().unwrap_or_else(|| "MANIFEST.sha256".to_string()));
+            let content = fs::read_to_string(&manifest_path).expect("failed reading manifest");
+            let current = scan_dir(&root).expect("failed scanning directory");
+            let mut mismatches = 0;
+            for line in content.lines() {
+                if let Some((expected, rel)) = line.split_once("  ") {
+                    match current.get(rel) {
+                        Some(actual) if actual == expected => {}
+                        _ => {
+                            eprintln!("DRIFT: {rel}");
+                            mismatches += 1;
+                        }
+                    }
+                }
+            }
+            if mismatches > 0 {
+                std::process::exit(1);
+            }
+        }
+        _ => {
+            eprintln!("Usage: integrity-cli <scan|check> <dir> [manifest_path]");
+            std::process::exit(2);
+        }
+    }
+}
+[package]
+name = "integrity-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sha2 = "0.10"
+walkdir = "2.5"
+encrypt.py#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_DIR="${1:-.}"
+BACKUP_ROOT="${2:-$HOME/backups}"
+TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+STAGE_DIR="$(mktemp -d)"
+ARCHIVE_BASENAME="backup_${TIMESTAMP}"
+TAR_FILE="${STAGE_DIR}/${ARCHIVE_BASENAME}.tar"
+ZST_FILE="${BACKUP_ROOT}/${ARCHIVE_BASENAME}.tar.zst"
+MANIFEST_FILE="${BACKUP_ROOT}/${ARCHIVE_BASENAME}.sha256"
+
+cleanup() {
+  rm -rf "${STAGE_DIR}"
+}
+trap cleanup EXIT
+
+mkdir -p "${BACKUP_ROOT}"
+
+tar \
+  --exclude='.git' \
+  --exclude='target' \
+  --exclude='__pycache__' \
+  --exclude='node_modules' \
+  --exclude='.venv' \
+  --exclude='*.enc' \
+  -cf "${TAR_FILE}" \
+  -C "${SOURCE_DIR}" .
+
+zstd -19 -T0 --rm "${TAR_FILE}" -o "${ZST_FILE}"
+sha256sum "${ZST_FILE}" > "${MANIFEST_FILE}"
+
+if [[ "${ENCRYPT_BACKUP:-0}" == "1" ]] && [[ -f "scripts/vault_encrypt.py" ]]; then
+  python3 scripts/vault_encrypt.py encrypt "${ZST_FILE}" "${ZST_FILE}.enc"
+  sha256sum "${ZST_FILE}.enc" >> "${MANIFEST_FILE}"
+  rm -f "${ZST_FILE}"
+  echo "Encrypted backup created: ${ZST_FILE}.enc"
+else
+  echo "Backup created: ${ZST_FILE}"
+fi
+
+echo "Manifest created: ${MANIFEST_FILE}"
+#!/usr/bin/env python3
+import argparse
+import base64
+import os
+from pathlib import Path
+
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+SALT_SIZE = 16
+ITERATIONS = 480_000
+
+
+def derive_key(password: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=ITERATIONS,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(password.encode("utf-8")))
+
+
+def encrypt_file(src: Path, dst: Path, password: str) -> None:
+    salt = os.urandom(SALT_SIZE)
+    token = Fernet(derive_key(password, salt)).encrypt(src.read_bytes())
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(salt + token)
+
+
+def decrypt_file(src: Path, dst: Path, password: str) -> None:
+    raw = src.read_bytes()
+    salt, token = raw[:SALT_SIZE], raw[SALT_SIZE:]
+    plain = Fernet(derive_key(password, salt)).decrypt(token)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(plain)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Symmetric file encryption/decryption")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    enc_p = sub.add_parser("encrypt")
+    enc_p.add_argument("src", type=Path)
+    enc_p.add_argument("dst", type=Path)
+
+    dec_p = sub.add_parser("decrypt")
+    dec_p.add_argument("src", type=Path)
+    dec_p.add_argument("dst", type=Path)
+
+    args = parser.parse_args()
+    password = os.environ.get("VAULT_PASSPHRASE") or input("Enter vault passphrase: ")
+    if args.cmd == "encrypt":
+        encrypt_file(args.src, args.dst, password)
+    else:
+        decrypt_file(args.src, args.dst, password)
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+import argparse
+import hashlib
+from pathlib import Path
+
+EXCLUDE_DIRS = {".git", "__pycache__", "target", ".pytest_cache", "backups", "vault", "data"}
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def generate(root: Path, output: Path) -> None:
+    lines = []
+    for path in sorted(root.rglob("*")):
+        if path.is_dir() or any(part in EXCLUDE_DIRS for part in path.parts):
+            continue
+        if path.resolve() == output.resolve():
+            continue
+        rel = path.relative_to(root).as_posix()
+        lines.append(f"{sha256_file(path)}  {rel}")
+    output.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def verify(root: Path, manifest: Path) -> int:
+    mismatches = 0
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        expected, rel = line.split("  ", 1)
+        target = root / rel
+        if not target.exists() or sha256_file(target) != expected:
+            print(f"MISMATCH: {rel}")
+            mismatches += 1
+    return mismatches
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SHA-256 manifest generator and verifier")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    gen_p = sub.add_parser("generate")
+    gen_p.add_argument("--root", type=Path, default=Path("."))
+    gen_p.add_argument("--output", type=Path, default=Path("MANIFEST.sha256"))
+
+    ver_p = sub.add_parser("verify")
+    ver_p.add_argument("--root", type=Path, default=Path("."))
+    ver_p.add_argument("--manifest", type=Path, default=Path("MANIFEST.sha256"))
+
+    args = parser.parse_args()
+    if args.cmd == "generate":
+        generate(args.root, args.output)
+    else:
+        bad = verify(args.root, args.manifest)
+        raise SystemExit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()
+path.is#!/usr/bin/env python3
+import argparse
+import csv
+import hashlib
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+def canonical_record_hash(record: dict[str, Any]) -> str:
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def load_records(input_path: Path) -> list[dict[str, Any]]:
+    suffix = input_path.suffix.lower()
+    if suffix == ".csv":
+        with input_path.open("r", encoding="utf-8", newline="") as f:
+            return [dict(row) for row in csv.DictReader(f)]
+    if suffix in {".jsonl", ".ndjson"}:
+        records: list[dict[str, Any]] = []
+        for line in input_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+        return records
+    raise ValueError(f"Unsupported input format: {input_path.suffix}")
+
+
+def init_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pipeline_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            ingested_at TEXT NOT NULL,
+            record_hash TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def run_pipeline(
+    input_path: Path,
+    db_path: Path,
+    jsonl_out: Path,
+    metrics_out: Path,
+) -> dict[str, int]:
+    batch_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ingested_at = datetime.now(timezone.utc).isoformat()
+    raw_records = load_records(input_path)
+    conn = init_db(db_path)
+
+    inserted = 0
+    duplicates = 0
+    normalized_lines: list[str] = []
+
+    try:
+        with conn:
+            for item in raw_records:
+                rec_hash = canonical_record_hash(item)
+                envelope = {
+                    "batch_id": batch_id,
+                    "ingested_at": ingested_at,
+                    "record_hash": rec_hash,
+                    "data": item,
+                }
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO pipeline_events
+                        (batch_id, ingested_at, record_hash, payload_json)
+                    VALUES (?, ?, ?, ?);
+                    """,
+                    (batch_id, ingested_at, rec_hash, json.dumps(envelope, sort_keys=True)),
+                )
+                if cur.rowcount == 1:
+                    inserted += 1
+                    normalized_lines.append(json.dumps(envelope, sort_keys=True))
+                else:
+                    duplicates += 1
+    finally:
+        conn.close()
+
+    jsonl_out.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_out.write_text(
+        "\n".join(normalized_lines) + ("\n" if normalized_lines else ""),
+        encoding="utf-8",
+    )
+
+    metrics_out.parent.mkdir(parents=True, exist_ok=True)
+    metrics_text = (
+        "# HELP master_pipeline_records_total Total records processed in batch\n"
+        "# TYPE master_pipeline_records_total counter\n"
+        f'master_pipeline_records_total{{status="inserted"}} {inserted}\n'
+        f'master_pipeline_records_total{{status="duplicate"}} {duplicates}\n'
+        "# EOF\n"
+    )
+    metrics_out.write_text(metrics_text, encoding="utf-8")
+
+    return {
+        "total_input": len(raw_records),
+        "inserted": inserted,
+        "duplicates": duplicates,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Deterministic local data pipeline ingester")
+    parser.add_argument("--input", type=Path, required=True, help="Input .csv or .jsonl file")
+    parser.add_argument("--db", type=Path, default=Path("data/pipeline.sqlite"))
+    parser.add_argument("--jsonl-out", type=Path, default=Path("data/normalized.jsonl"))
+    parser.add_argument("--metrics-out", type=Path, default=Path("data/metrics.prom"))
+    args = parser.parse_args()
+
+    stats = run_pipeline(args.input, args.db, args.jsonl_out, args.metrics_out)
+    print(json.dumps(stats, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+Master-Hub/
+├── .github/
+│   └── workflows/
+│       └── master-pipeline-ci.yml
+├── .gitleaks.toml
+├── .gitignore
+├── README.md
+├── scripts/
+│   ├── bootstrap.sh
+│   ├── audit_gpg.sh
+│   ├── hash_manifest.py
+│   ├── vault_encrypt.py
+│   ├── backup_all.sh
+│   └── pipeline_ingest.py
+├── crates/
+│   └── integrity-cli/
+│       ├── Cargo.toml
+│       └── src/
+│           └── main.rs
+└── tests/
+    └── test_pipeline_and_tools.py
+README.md
+Robert Edward Evans 
+evansrobert517@gmail.com 
+evansrobert517@yahoo.com 
+adpsnake812@gmail.com 
+adpsnake7@gmail.com 
+To make your local repositories, automation pipelines, and AI workflows cleaner, safer, transparent, and aligned with good operational and compliance hygiene, add explicit secret/PII hygiene checks, honest data/AI provenance metadata, and fail-closed audit logging—while keeping all enforcement strictly local to files you authorize. (This is general software engineering guidance, not legal advice.)
+1. Clean Pipeline & Provenance Guard (scripts/clean_pipeline_guard.py)
+This script builds on your local audit workflow to:
+ * Scan non-ignored text/config files for accidental private keys, tokens, or SSN-like patterns before committing or bundling.
+ * Require and verify a clean provenance.json manifest (declaring whether data is synthetic/sanitized, local-only, and non-clinical/non-legal-advice) alongside SHA256SUMS.
+ * Output a clear, honest JSON report with deterministic exit codes (0 when clean, 1 when issues are found).
+#!/usr/bin/env python3
+"""Run local hygiene, provenance transparency, and SHA-256 integrity checks."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+from typing import Any
+
+SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv"}
+
+SENSITIVE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("private_key_block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("github_classic_pat", re.compile(r"\bghp_[A-Za-z0-9]{36}\b")),
+    ("github_fine_pat", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
+    ("ssn_like_pattern", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
+]
+
+REQUIRED_PROVENANCE_KEYS = {
+    "service_name",
+    "data_classification",
+    "local_only_processing",
+    "automated_external_actions",
+    "disclaimer",
+}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def scan_for_secrets(root: Path) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or any(part in SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            for label, pattern in SENSITIVE_PATTERNS:
+                if pattern.search(line):
+                    findings.append(
+                        {
+                            "file": str(path.relative_to(root)),
+                            "line": line_no,
+                            "rule": label,
+                        }
+                    )
+    return findings
+
+
+def check_provenance(provenance_path: Path | None) -> dict[str, Any]:
+    if provenance_path is None:
+        return {"checked": False, "ok": True, "errors": []}
+    if not provenance_path.is_file():
+        return {"checked": True, "ok": False, "errors": [f"Missing provenance file: {provenance_path}"]}
+    try:
+        data = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"checked": True, "ok": False, "errors": [f"Invalid provenance JSON: {exc}"]}
+
+    errors: list[str] = []
+    if not isinstance(data, dict):
+        return {"checked": True, "ok": False, "errors": ["Provenance root must be a JSON object"]}
+
+    missing = sorted(REQUIRED_PROVENANCE_KEYS - set(data.keys()))
+    if missing:
+        errors.append(f"Missing required provenance fields: {', '.join(missing)}")
+
+    if "local_only_processing" in data and not isinstance(data["local_only_processing"], bool):
+        errors.append("Field 'local_only_processing' must be a boolean")
+
+    if "automated_external_actions" in data and data["automated_external_actions"] is not False:
+        errors.append("Field 'automated_external_actions' must be explicitly false for safe local runs")
+
+    return {"checked": True, "ok": len(errors) == 0, "errors": errors}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Clean, transparent local pipeline guard.")
+    parser.add_argument("--root", type=Path, default=Path("."), help="Workspace root to audit")
+    parser.add_argument("--provenance", type=Path, default=None, help="Optional provenance.json file")
+    args = parser.parse_args()
+
+    root = args.root.resolve()
+    provenance_path = args.provenance.resolve() if args.provenance else None
+
+    secret_findings = scan_for_secrets(root)
+    provenance_report = check_provenance(provenance_path)
+
+    passed = len(secret_findings) == 0 and provenance_report["ok"]
+    summary = {
+        "root": str(root),
+        "passed": passed,
+        "secret_or_pii_findings_count": len(secret_findings),
+        "secret_or_pii_findings": secret_findings,
+        "provenance": provenance_report,
+    }
+    print(json.dumps(summary, indent=2))
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+2. Core Principles for Clean, Honest, Lawful Pipelines
+ * Explicit boundaries over hidden automation: Keep scripts local-first, read-only where possible, and explicit about any outbound actions (automated_external_actions: false unless intentionally invoked). Never embed active credentials, private keys, or real personal identifiers in code or sample fixtures.
+ * Honest AI & telemetry reporting: Label synthetic test data and simulated states clearly, avoid fabricated metrics or overclaimed certainty, and log deterministic hashes (sha256sum) so results can be independently verified.
+ * Fair & lawful access practices: Only audit systems, directories, and accounts you own or are explicitly authorized to manage, and respect platform terms, privacy controls, and applicable laws.
+ * Professional release hygiene: Keep commits small and scoped, enforce signed commits/tags on protected branches, and run automated tests (pytest) before tagging releases.
+provenance.json
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${1:-.}"
+MANIFEST_PATH="${2:-}"
+PROVENANCE_PATH="${3:-}"
+LOG_DIR="${PIPELINE_LOG_DIR:-${HOME}/.local/state/master_pipeline}"
+TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+LOG_FILE="${LOG_DIR}/pipeline_runs.jsonl"
+
+mkdir -p "${LOG_DIR}"
+
+AUDIT_CMD=(python3 scripts/local_workspace_audit.py --root "${ROOT_DIR}")
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  AUDIT_CMD+=(--manifest "${MANIFEST_PATH}")
+fi
+
+GUARD_CMD=(python3 scripts/clean_pipeline_guard.py --root "${ROOT_DIR}")
+if [[ -n "${PROVENANCE_PATH}" ]]; then
+  GUARD_CMD+=(--provenance "${PROVENANCE_PATH}")
+fi
+
+echo "[1/3] Running local workspace & manifest audit..."
+"${AUDIT_CMD[@]}"
+
+echo "[2/3] Running clean pipeline & provenance guard..."
+"${GUARD_CMD[@]}"
+
+echo "[3/3] Running pytest suite..."
+pytest -q
+
+printf '{"timestamp_utc":"%s","root":"%s","status":"PASSED"}\n' \
+  "${TIMESTAMP_UTC}" \
+  "$(cd "${ROOT_DIR}" && pwd)" >> "${LOG_FILE}"
+
+echo "Master pipeline passed. Logged to ${LOG_FILE}"
+chmod +x scripts/run_master_pipeline.sh
+bash scripts/run_master_pipeline.sh . build/SHA256SUMS config/provenance.json
+tail -n 5 "${HOME}/.local/state/master_pipeline/pipeline_runs.jsonl"
+A practical "Master System & Pipeline" for a local-first engineering setup is a single, deterministic entry point that runs your validation checks, verifies SHA-256 integrity manifests, runs pytest, and records an auditable local log—without hidden network side effects or overclaimed automation. (This is general software engineering guidance, not legal or security advice.)
+1. Unified Local Master Runner (scripts/run_master_pipeline.sh)
+This shell script executes your workspace audit, clean pipeline/provenance guard, and pytest suite in order, writing a timestamped JSON-lines summary to a local log directory while failing closed (set -euo pipefail) if any check fails.
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${1:-.}"
+MANIFEST_PATH="${2:-}"
+PROVENANCE_PATH="${3:-}"
+LOG_DIR="${PIPELINE_LOG_DIR:-${HOME}/.local/state/master_pipeline}"
+TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+LOG_FILE="${LOG_DIR}/pipeline_runs.jsonl"
+
+mkdir -p "${LOG_DIR}"
+
+AUDIT_CMD=(python3 scripts/local_workspace_audit.py --root "${ROOT_DIR}")
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  AUDIT_CMD+=(--manifest "${MANIFEST_PATH}")
+fi
+
+GUARD_CMD=(python3 scripts/clean_pipeline_guard.py --root "${ROOT_DIR}")
+if [[ -n "${PROVENANCE_PATH}" ]]; then
+  GUARD_CMD+=(--provenance "${PROVENANCE_PATH}")
+fi
+
+echo "[1/3] Running local workspace & manifest audit..."
+"${AUDIT_CMD[@]}"
+
+echo "[2/3] Running clean pipeline & provenance guard..."
+"${GUARD_CMD[@]}"
+
+echo "[3/3] Running pytest suite..."
+pytest -q
+
+printf '{"timestamp_utc":"%s","root":"%s","status":"PASSED"}\n' \
+  "${TIMESTAMP_UTC}" \
+  "$(cd "${ROOT_DIR}" && pwd)" >> "${LOG_FILE}"
+
+echo "Master pipeline passed. Logged to ${LOG_FILE}"
+
+2. How to Run & Verify It
+ * Make the script executable:
+   chmod +x scripts/run_master_pipeline.sh
+
+ * Run against your repository root (and optionally pass a SHA256SUMS manifest and provenance.json):
+   bash scripts/run_master_pipeline.sh . build/SHA256SUMS config/provenance.json
+
+ * Inspect the append-only run log:
+   tail -n 5 "${HOME}/.local/state/master_pipeline/pipeline_runs.jsonl"
+
+3. Guardrails for Multi-Stage & Cross-Repo Pipelines
+ * Explicit over implicit: Pass paths, remotes, and flags explicitly rather than relying on silent background changes or unverified external endpoints.
+ * Immutable, checksummed artifacts: Pair every archive or release bundle (such as tar.zst) with a sha256sum manifest and verify it before moving files to backup or mirror targets.
+ * Honest boundaries: Keep sensitive records, credentials, and real personal data out of Git repositories, and treat any simulated or synthetic outputs strictly as test artifacts.
+Here is how to add deterministic tar.zst archive packaging with matching .sha256 manifests and customizable workspace rules (--forbid-name, --require-path) so your pipeline covers both artifact bundling and stricter repository checks.
+1. Packaging tar.zst Bundles with SHA-256 Checksums (scripts/package_bundle.py)
+This script packages a target directory into a deterministic .tar.zst archive (sorting entries, normalizing timestamps/permissions, and setting mtime=0 for reproducibility) and writes a companion <archive>.sha256 file.
+#!/usr/bin/env python3
+"""Create a deterministic tar.zst archive and companion SHA-256 checksum file."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def _reset_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    if info.isdir():
+        info.mode = 0o755
+    elif info.isfile():
+        info.mode = 0o644
+    return info
+
+
+def build_deterministic_tar(source_dir: Path, tar_path: Path) -> None:
+    source_resolved = source_dir.resolve()
+    files_and_dirs: list[tuple[Path, str]] = []
+
+    for current_root, dirnames, filenames in os.walk(source_resolved):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
+        filenames.sort()
+
+        current_path = Path(current_root)
+        rel_root = current_path.relative_to(source_resolved)
+
+        if str(rel_root) != ".":
+            files_and_dirs.append((current_path, rel_root.as_posix()))
+
+        for fname in filenames:
+            full_file = current_path / fname
+            if full_file.is_symlink():
+                continue
+            arcname = fname if str(rel_root) == "." else f"{rel_root.as_posix()}/{fname}"
+            files_and_dirs.append((full_file, arcname))
+
+    with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for src_path, arcname in files_and_dirs:
+            tf.add(src_path, arcname=arcname, recursive=False, filter=_reset_tarinfo)
+
+
+def compress_zst(tar_path: Path, zst_path: Path, level: int = 3) -> None:
+    zst_path.parent.mkdir(parents=True, exist_ok=True)
+    with tar_path.open("rb") as src, zst_path.open("wb") as dst:
+        subprocess.run(
+            ["zstd", f"-{level}", "--force", "--stdout"],
+            stdin=src,
+            stdout=dst,
+            check=True,
+        )
+
+
+def write_sha256_sidecar(artifact_path: Path, checksum_path: Path) -> str:
+    h = hashlib.sha256()
+    with artifact_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    checksum_path.write_text(f"{digest}  {artifact_path.name}\n", encoding="utf-8")
+    return digest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Package deterministic tar.zst bundle + SHA-256.")
+    parser.add_argument("--source", required=True, help="Directory to archive")
+    parser.add_argument("--out", required=True, help="Output .tar.zst path")
+    parser.add_argument("--level", type=int, default=3, help="zstd compression level (1-19)")
+    args = parser.parse_args(argv)
+
+    source_dir = Path(args.source)
+    if not source_dir.is_dir():
+        print(f"[BUNDLE FAIL] Source directory not found: {source_dir}", file=sys.stderr)
+        return 1
+
+    zst_path = Path(args.out)
+    if not zst_path.name.endswith(".tar.zst"):
+        print(f"[BUNDLE FAIL] Output path must end with .tar.zst: {zst_path}", file=sys.stderr)
+        return 1
+
+    checksum_path = Path(f"{zst_path}.sha256")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_tar = Path(tmpdir) / "bundle.tar"
+            build_deterministic_tar(source_dir, raw_tar)
+            compress_zst(raw_tar, zst_path, level=args.level)
+        digest = write_sha256_sidecar(zst_path, checksum_path)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"[BUNDLE FAIL] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[BUNDLE OK] archive={zst_path} sha256={digest} sidecar={checksum_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+2. Custom Rules in scripts/local_workspace_audit.py
+Update audit_workspace and main in scripts/local_workspace_audit.py so you can pass repeatable --require-path and --forbid-name flags from the CLI or wrapper script:
+# Add these helper checks inside audit_workspace(root, manifest, required_paths=(), forbidden_names=()):
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        ignored_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+        for path in root_resolved.rglob("*"):
+            if any(part in ignored_dirs for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+
+And in main:
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+
+3. Wiring Packaging & Verification Together
+chmod +x scripts/package_bundle.py
+
+# 1. Build a checksummed .tar.zst bundle into build/
+python3 scripts/package_bundle.py --source . --out build/workspace_bundle.tar.zst
+
+# 2. Verify the bundle's own SHA-256 sidecar from build/
+(cd build && sha256sum -c workspace_bundle.tar.zst.sha256)
+
+# 3. Run your master pipeline with custom workspace rules
+python3 scripts/local_workspace_audit.py \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --require-path README.md \
+  --forbid-name .DS_Store
+
+Would you like to wire scripts/package_bundle.py directly into scripts/run_master_pipeline.sh behind an optional flag (like --bundle-out), or add tests for the new packaging and custom audit rules?
+chmod +x scripts/package_bundle.py
+
+# 1. Build a checksummed .tar.zst bundle into build/
+python3 scripts/package_bundle.py --source . --out build/workspace_bundle.tar.zst
+
+# 2. Verify the bundle's own SHA-256 sidecar from build/
+(cd build && sha256sum -c workspace_bundle.tar.zst.sha256)
+
+# 3. Run your master pipeline with custom workspace rules
+python3 scripts/local_workspace_audit.py \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --require-path README.md \
+  --forbid-name .DS_Store
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+# Add these helper checks inside audit_workspace(root, manifest, required_paths=(), forbidden_names=()):
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        ignored_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+        for path in root_resolved.rglob("*"):
+            if any(part in ignored_dirs for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+#!/usr/bin/env python3
+"""Create a deterministic tar.zst archive and companion SHA-256 checksum file."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def _reset_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    if info.isdir():
+        info.mode = 0o755
+    elif info.isfile():
+        info.mode = 0o644
+    return info
+
+
+def build_deterministic_tar(source_dir: Path, tar_path: Path) -> None:
+    source_resolved = source_dir.resolve()
+    files_and_dirs: list[tuple[Path, str]] = []
+
+    for current_root, dirnames, filenames in os.walk(source_resolved):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
+        filenames.sort()
+
+        current_path = Path(current_root)
+        rel_root = current_path.relative_to(source_resolved)
+
+        if str(rel_root) != ".":
+            files_and_dirs.append((current_path, rel_root.as_posix()))
+
+        for fname in filenames:
+            full_file = current_path / fname
+            if full_file.is_symlink():
+                continue
+            arcname = fname if str(rel_root) == "." else f"{rel_root.as_posix()}/{fname}"
+            files_and_dirs.append((full_file, arcname))
+
+    with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for src_path, arcname in files_and_dirs:
+            tf.add(src_path, arcname=arcname, recursive=False, filter=_reset_tarinfo)
+
+
+def compress_zst(tar_path: Path, zst_path: Path, level: int = 3) -> None:
+    zst_path.parent.mkdir(parents=True, exist_ok=True)
+    with tar_path.open("rb") as src, zst_path.open("wb") as dst:
+        subprocess.run(
+            ["zstd", f"-{level}", "--force", "--stdout"],
+            stdin=src,
+            stdout=dst,
+            check=True,
+        )
+
+
+def write_sha256_sidecar(artifact_path: Path, checksum_path: Path) -> str:
+    h = hashlib.sha256()
+    with artifact_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    checksum_path.write_text(f"{digest}  {artifact_path.name}\n", encoding="utf-8")
+    return digest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Package deterministic tar.zst bundle + SHA-256.")
+    parser.add_argument("--source", required=True, help="Directory to archive")
+    parser.add_argument("--out", required=True, help="Output .tar.zst path")
+    parser.add_argument("--level", type=int, default=3, help="zstd compression level (1-19)")
+    args = parser.parse_args(argv)
+
+    source_dir = Path(args.source)
+    if not source_dir.is_dir():
+        print(f"[BUNDLE FAIL] Source directory not found: {source_dir}", file=sys.stderr)
+        return 1
+
+    zst_path = Path(args.out)
+    if not zst_path.name.endswith(".tar.zst"):
+        print(f"[BUNDLE FAIL] Output path must end with .tar.zst: {zst_path}", file=sys.stderr)
+        return 1
+
+    checksum_path = Path(f"{zst_path}.sha256")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_tar = Path(tmpdir) / "bundle.tar"
+            build_deterministic_tar(source_dir, raw_tar)
+            compress_zst(raw_tar, zst_path, level=args.level)
+        digest = write_sha256_sidecar(zst_path, checksum_path)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"[BUNDLE FAIL] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[BUNDLE OK] archive={zst_path} sha256={digest} sidecar={checksum_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+chmod +x scripts/package_bundle.py
+
+# 1. Build a checksummed .tar.zst bundle into build/
+python3 scripts/package_bundle.py --source . --out build/workspace_bundle.tar.zst
+
+# 2. Verify the bundle's own SHA-256 sidecar from build/
+(cd build && sha256sum -c workspace_bundle.tar.zst.sha256)
+
+# 3. Run your master pipeline with custom workspace rules
+python3 scripts/local_workspace_audit.py \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --require-path README.md \
+  --forbid-name .DS_Store
+bundle.py
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+# Add these helper checks inside audit_workspace(root, manifest, required_paths=(), forbidden_names=()):
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        ignored_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+        for path in root_resolved.rglob("*"):
+            if any(part in ignored_dirs for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+path.name
+path.name
+#!/usr/bin/env python3
+"""Create a deterministic tar.zst archive and companion SHA-256 checksum file."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def _reset_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    if info.isdir():
+        info.mode = 0o755
+    elif info.isfile():
+        info.mode = 0o644
+    return info
+
+
+def build_deterministic_tar(source_dir: Path, tar_path: Path) -> None:
+    source_resolved = source_dir.resolve()
+    files_and_dirs: list[tuple[Path, str]] = []
+
+    for current_root, dirnames, filenames in os.walk(source_resolved):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
+        filenames.sort()
+
+        current_path = Path(current_root)
+        rel_root = current_path.relative_to(source_resolved)
+
+        if str(rel_root) != ".":
+            files_and_dirs.append((current_path, rel_root.as_posix()))
+
+        for fname in filenames:
+            full_file = current_path / fname
+            if full_file.is_symlink():
+                continue
+            arcname = fname if str(rel_root) == "." else f"{rel_root.as_posix()}/{fname}"
+            files_and_dirs.append((full_file, arcname))
+
+    with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for src_path, arcname in files_and_dirs:
+            tf.add(src_path, arcname=arcname, recursive=False, filter=_reset_tarinfo)
+
+
+def compress_zst(tar_path: Path, zst_path: Path, level: int = 3) -> None:
+    zst_path.parent.mkdir(parents=True, exist_ok=True)
+    with tar_path.open("rb") as src, zst_path.open("wb") as dst:
+        subprocess.run(
+            ["zstd", f"-{level}", "--force", "--stdout"],
+            stdin=src,
+            stdout=dst,
+            check=True,
+        )
+
+
+def write_sha256_sidecar(artifact_path: Path, checksum_path: Path) -> str:
+    h = hashlib.sha256()
+    with artifact_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    checksum_path.write_text(f"{digest}  {artifact_path.name}\n", encoding="utf-8")
+    return digest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Package deterministic tar.zst bundle + SHA-256.")
+    parser.add_argument("--source", required=True, help="Directory to archive")
+    parser.add_argument("--out", required=True, help="Output .tar.zst path")
+    parser.add_argument("--level", type=int, default=3, help="zstd compression level (1-19)")
+    args = parser.parse_args(argv)
+
+    source_dir = Path(args.source)
+    if not source_dir.is_dir():
+        print(f"[BUNDLE FAIL] Source directory not found: {source_dir}", file=sys.stderr)
+        return 1
+
+    zst_path = Path(args.out)
+    if not zst_path.name.endswith(".tar.zst"):
+        print(f"[BUNDLE FAIL] Output path must end with .tar.zst: {zst_path}", file=sys.stderr)
+        return 1
+
+    checksum_path = Path(f"{zst_path}.sha256")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_tar = Path(tmpdir) / "bundle.tar"
+            build_deterministic_tar(source_dir, raw_tar)
+            compress_zst(raw_tar, zst_path, level=args.level)
+        digest = write_sha256_sidecar(zst_path, checksum_path)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"[BUNDLE FAIL] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[BUNDLE OK] archive={zst_path} sha256={digest} sidecar={checksum_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="."
+MANIFEST_PATH=""
+PROVENANCE_PATH=""
+BUNDLE_OUT=""
+ZSTD_LEVEL="${ZSTD_LEVEL:-3}"
+LOG_DIR="${PIPELINE_LOG_DIR:-${HOME}/.local/state/master_pipeline}"
+LOG_FILE="${LOG_DIR}/pipeline_runs.jsonl"
+
+REQUIRED_PATHS=()
+FORBIDDEN_NAMES=()
+
+# Allow positional arguments first for backward compatibility:
+#   run_master_pipeline.sh [ROOT_DIR] [MANIFEST_PATH] [PROVENANCE_PATH] [--flag value ...]
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  ROOT_DIR="${1}"
+  shift
+fi
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  MANIFEST_PATH="${1}"
+  shift
+fi
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  PROVENANCE_PATH="${1}"
+  shift
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root)
+      ROOT_DIR="${2:?--root requires a path}"
+      shift 2
+      ;;
+    --manifest)
+      MANIFEST_PATH="${2:?--manifest requires a path}"
+      shift 2
+      ;;
+    --provenance)
+      PROVENANCE_PATH="${2:?--provenance requires a path}"
+      shift 2
+      ;;
+    --bundle-out)
+      BUNDLE_OUT="${2:?--bundle-out requires a path}"
+      shift 2
+      ;;
+    --zstd-level)
+      ZSTD_LEVEL="${2:?--zstd-level requires an integer}"
+      shift 2
+      ;;
+    --require-path)
+      REQUIRED_PATHS+=("${2:?--require-path requires a relative path}")
+      shift 2
+      ;;
+    --forbid-name)
+      FORBIDDEN_NAMES+=("${2:?--forbid-name requires a file or directory name}")
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+mkdir -p "${LOG_DIR}"
+ABS_ROOT="$(cd "${ROOT_DIR}" && pwd)"
+
+json_escape() {
+  python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+record_run() {
+  local status="$1"
+  local detail="$2"
+  local ts_utc
+  ts_utc="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+
+  printf '{"timestamp_utc":%s,"root":%s,"status":%s,"detail":%s}\n' \
+    "$(json_escape "${ts_utc}")" \
+    "$(json_escape "${ABS_ROOT}")" \
+    "$(json_escape "${status}")" \
+    "$(json_escape "${detail}")" >> "${LOG_FILE}"
+}
+
+on_error() {
+  local exit_code="$?"
+  record_run "FAILED" "exit_code=${exit_code}"
+  exit "${exit_code}"
+}
+
+trap on_error ERR
+
+AUDIT_CMD=(python3 scripts/local_workspace_audit.py --root "${ABS_ROOT}")
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  AUDIT_CMD+=(--manifest "${MANIFEST_PATH}")
+fi
+for req_path in "${REQUIRED_PATHS[@]}"; do
+  AUDIT_CMD+=(--require-path "${req_path}")
+done
+for bad_name in "${FORBIDDEN_NAMES[@]}"; do
+  AUDIT_CMD+=(--forbid-name "${bad_name}")
+done
+
+GUARD_CMD=(python3 scripts/clean_pipeline_guard.py --root "${ABS_ROOT}")
+if [[ -n "${PROVENANCE_PATH}" ]]; then
+  GUARD_CMD+=(--provenance "${PROVENANCE_PATH}")
+fi
+
+echo "[1/4] Running local workspace & manifest audit..."
+"${AUDIT_CMD[@]}"
+
+echo "[2/4] Running clean pipeline & provenance guard..."
+"${GUARD_CMD[@]}"
+
+echo "[3/4] Running pytest suite..."
+pytest -q
+
+if [[ -n "${BUNDLE_OUT}" ]]; then
+  echo "[4/4] Packaging deterministic bundle & verifying SHA-256 sidecar..."
+  python3 scripts/package_bundle.py \
+    --source "${ABS_ROOT}" \
+    --out "${BUNDLE_OUT}" \
+    --level "${ZSTD_LEVEL}"
+
+  BUNDLE_DIR="$(cd "$(dirname "${BUNDLE_OUT}")" && pwd)"
+  BUNDLE_FILE="$(basename "${BUNDLE_OUT}")"
+  (cd "${BUNDLE_DIR}" && sha256sum -c "${BUNDLE_FILE}.sha256")
+  record_run "PASSED" "bundle=${BUNDLE_OUT}"
+else
+  echo "[4/4] Skipping bundle packaging (no --bundle-out specified)."
+  record_run "PASSED" "audit+guard+pytest"
+fi
+
+trap - ERR
+echo "Master pipeline passed. Logged to ${LOG_FILE}"
+tar.zst
+chmod +x scripts/package_bundle.py
+
+# 1. Build a checksummed .tar.zst bundle into build/
+python3 scripts/package_bundle.py --source . --out build/workspace_bundle.tar.zst
+
+# 2. Verify the bundle's own SHA-256 sidecar from build/
+(cd build && sha256sum -c workspace_bundle.tar.zst.sha256)
+
+# 3. Run your master pipeline with custom workspace rules
+python3 scripts/local_workspace_audit.py \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --require-path README.md \
+  --forbid-name .DS_Store
+bundle.py
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+# Add these helper checks inside audit_workspace(root, manifest, required_paths=(), forbidden_names=()):
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        ignored_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+        for path in root_resolved.rglob("*"):
+            if any(part in ignored_dirs for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+path.name
+path.name
+#!/usr/bin/env python3
+"""Create a deterministic tar.zst archive and companion SHA-256 checksum file."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def _reset_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    if info.isdir():
+        info.mode = 0o755
+    elif info.isfile():
+        info.mode = 0o644
+    return info
+
+
+def build_deterministic_tar(source_dir: Path, tar_path: Path) -> None:
+    source_resolved = source_dir.resolve()
+    files_and_dirs: list[tuple[Path, str]] = []
+
+    for current_root, dirnames, filenames in os.walk(source_resolved):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
+        filenames.sort()
+
+        current_path = Path(current_root)
+        rel_root = current_path.relative_to(source_resolved)
+
+        if str(rel_root) != ".":
+            files_and_dirs.append((current_path, rel_root.as_posix()))
+
+        for fname in filenames:
+            full_file = current_path / fname
+            if full_file.is_symlink():
+                continue
+            arcname = fname if str(rel_root) == "." else f"{rel_root.as_posix()}/{fname}"
+            files_and_dirs.append((full_file, arcname))
+
+    with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for src_path, arcname in files_and_dirs:
+            tf.add(src_path, arcname=arcname, recursive=False, filter=_reset_tarinfo)
+
+
+def compress_zst(tar_path: Path, zst_path: Path, level: int = 3) -> None:
+    zst_path.parent.mkdir(parents=True, exist_ok=True)
+    with tar_path.open("rb") as src, zst_path.open("wb") as dst:
+        subprocess.run(
+            ["zstd", f"-{level}", "--force", "--stdout"],
+            stdin=src,
+            stdout=dst,
+            check=True,
+        )
+
+
+def write_sha256_sidecar(artifact_path: Path, checksum_path: Path) -> str:
+    h = hashlib.sha256()
+    with artifact_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    checksum_path.write_text(f"{digest}  {artifact_path.name}\n", encoding="utf-8")
+    return digest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Package deterministic tar.zst bundle + SHA-256.")
+    parser.add_argument("--source", required=True, help="Directory to archive")
+    parser.add_argument("--out", required=True, help="Output .tar.zst path")
+    parser.add_argument("--level", type=int, default=3, help="zstd compression level (1-19)")
+    args = parser.parse_args(argv)
+
+    source_dir = Path(args.source)
+    if not source_dir.is_dir():
+        print(f"[BUNDLE FAIL] Source directory not found: {source_dir}", file=sys.stderr)
+        return 1
+
+    zst_path = Path(args.out)
+    if not zst_path.name.endswith(".tar.zst"):
+        print(f"[BUNDLE FAIL] Output path must end with .tar.zst: {zst_path}", file=sys.stderr)
+        return 1
+
+    checksum_path = Path(f"{zst_path}.sha256")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_tar = Path(tmpdir) / "bundle.tar"
+            build_deterministic_tar(source_dir, raw_tar)
+            compress_zst(raw_tar, zst_path, level=args.level)
+        digest = write_sha256_sidecar(zst_path, checksum_path)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"[BUNDLE FAIL] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[BUNDLE OK] archive={zst_path} sha256={digest} sidecar={checksum_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="."
+MANIFEST_PATH=""
+PROVENANCE_PATH=""
+BUNDLE_OUT=""
+ZSTD_LEVEL="${ZSTD_LEVEL:-3}"
+LOG_DIR="${PIPELINE_LOG_DIR:-${HOME}/.local/state/master_pipeline}"
+LOG_FILE="${LOG_DIR}/pipeline_runs.jsonl"
+
+REQUIRED_PATHS=()
+FORBIDDEN_NAMES=()
+
+# Allow positional arguments first for backward compatibility:
+#   run_master_pipeline.sh [ROOT_DIR] [MANIFEST_PATH] [PROVENANCE_PATH] [--flag value ...]
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  ROOT_DIR="${1}"
+  shift
+fi
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  MANIFEST_PATH="${1}"
+  shift
+fi
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  PROVENANCE_PATH="${1}"
+  shift
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root)
+      ROOT_DIR="${2:?--root requires a path}"
+      shift 2
+      ;;
+    --manifest)
+      MANIFEST_PATH="${2:?--manifest requires a path}"
+      shift 2
+      ;;
+    --provenance)
+      PROVENANCE_PATH="${2:?--provenance requires a path}"
+      shift 2
+      ;;
+    --bundle-out)
+      BUNDLE_OUT="${2:?--bundle-out requires a path}"
+      shift 2
+      ;;
+    --zstd-level)
+      ZSTD_LEVEL="${2:?--zstd-level requires an integer}"
+      shift 2
+      ;;
+    --require-path)
+      REQUIRED_PATHS+=("${2:?--require-path requires a relative path}")
+      shift 2
+      ;;
+    --forbid-name)
+      FORBIDDEN_NAMES+=("${2:?--forbid-name requires a file or directory name}")
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+mkdir -p "${LOG_DIR}"
+ABS_ROOT="$(cd "${ROOT_DIR}" && pwd)"
+
+json_escape() {
+  python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+record_run() {
+  local status="$1"
+  local detail="$2"
+  local ts_utc
+  ts_utc="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+
+  printf '{"timestamp_utc":%s,"root":%s,"status":%s,"detail":%s}\n' \
+    "$(json_escape "${ts_utc}")" \
+    "$(json_escape "${ABS_ROOT}")" \
+    "$(json_escape "${status}")" \
+    "$(json_escape "${detail}")" >> "${LOG_FILE}"
+}
+
+on_error() {
+  local exit_code="$?"
+  record_run "FAILED" "exit_code=${exit_code}"
+  exit "${exit_code}"
+}
+
+trap on_error ERR
+
+AUDIT_CMD=(python3 scripts/local_workspace_audit.py --root "${ABS_ROOT}")
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  AUDIT_CMD+=(--manifest "${MANIFEST_PATH}")
+fi
+for req_path in "${REQUIRED_PATHS[@]}"; do
+  AUDIT_CMD+=(--require-path "${req_path}")
+done
+for bad_name in "${FORBIDDEN_NAMES[@]}"; do
+  AUDIT_CMD+=(--forbid-name "${bad_name}")
+done
+
+GUARD_CMD=(python3 scripts/clean_pipeline_guard.py --root "${ABS_ROOT}")
+if [[ -n "${PROVENANCE_PATH}" ]]; then
+  GUARD_CMD+=(--provenance "${PROVENANCE_PATH}")
+fi
+
+echo "[1/4] Running local workspace & manifest audit..."
+"${AUDIT_CMD[@]}"
+
+echo "[2/4] Running clean pipeline & provenance guard..."
+"${GUARD_CMD[@]}"
+
+echo "[3/4] Running pytest suite..."
+pytest -q
+
+if [[ -n "${BUNDLE_OUT}" ]]; then
+  echo "[4/4] Packaging deterministic bundle & verifying SHA-256 sidecar..."
+  python3 scripts/package_bundle.py \
+    --source "${ABS_ROOT}" \
+    --out "${BUNDLE_OUT}" \
+    --level "${ZSTD_LEVEL}"
+
+  BUNDLE_DIR="$(cd "$(dirname "${BUNDLE_OUT}")" && pwd)"
+  BUNDLE_FILE="$(basename "${BUNDLE_OUT}")"
+  (cd "${BUNDLE_DIR}" && sha256sum -c "${BUNDLE_FILE}.sha256")
+  record_run "PASSED" "bundle=${BUNDLE_OUT}"
+else
+  echo "[4/4] Skipping bundle packaging (no --bundle-out specified)."
+  record_run "PASSED" "audit+guard+pytest"
+fi
+
+trap - ERR
+echo "Master pipeline passed. Logged to ${LOG_FILE}"
+#!/usr/bin/env python3
+"""Audit a local workspace directory, manifest checksums, and policy rules."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import sys
+from pathlib import Path
+
+IGNORED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def parse_manifest(manifest_path: Path) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for line_no, raw_line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = raw_line.rstrip("\r\n").split("  ", maxsplit=1)
+        if len(parts) != 2:
+            parts = raw_line.rstrip("\r\n").split(" *", maxsplit=1)
+        if len(parts) != 2:
+            raise ValueError(f"{manifest_path}:{line_no}: malformed manifest line")
+        digest, rel_path = parts[0].strip().lower(), parts[1].strip()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError(f"{manifest_path}:{line_no}: invalid SHA-256 digest")
+        entries.append((digest, rel_path))
+    return entries
+
+
+def sha256_file(file_path: Path) -> str:
+    h = hashlib.sha256()
+    with file_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_within_root(target: Path, root_resolved: Path) -> bool:
+    try:
+        target.relative_to(root_resolved)
+        return True
+    except ValueError:
+        return False
+
+
+def audit_workspace(
+    root: Path,
+    manifest: Path | None,
+    required_paths: tuple[str, ...] | list[str] = (),
+    forbidden_names: tuple[str, ...] | list[str] = (),
+) -> list[str]:
+    errors: list[str] = []
+    if not root.exists() or not root.is_dir():
+        return [f"Root directory does not exist or is not a directory: {root}"]
+
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not _is_within_root(req_target, root_resolved):
+            errors.append(f"Required path escapes root: {req_rel}")
+            continue
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        for path in root_resolved.rglob("*"):
+            if any(part in IGNORED_DIRS for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+
+    if manifest is not None:
+        if not manifest.is_file():
+            errors.append(f"Manifest file not found: {manifest}")
+            return errors
+        try:
+            entries = parse_manifest(manifest)
+        except ValueError as exc:
+            errors.append(str(exc))
+            return errors
+
+        for expected_digest, rel_path in entries:
+            target = (root_resolved / rel_path).resolve()
+            if not _is_within_root(target, root_resolved):
+                errors.append(f"Manifest path escapes root: {rel_path}")
+                continue
+            if not target.is_file():
+                errors.append(f"Missing manifest artifact: {rel_path}")
+                continue
+            actual_digest = sha256_file(target)
+            if actual_digest != expected_digest:
+                errors.append(
+                    f"Checksum mismatch for {rel_path}: expected {expected_digest}, got {actual_digest}"
+                )
+
+    return errors
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Audit local workspace and SHA256SUMS manifest.")
+    parser.add_argument("--root", required=True, help="Repository or workspace root directory")
+    parser.add_argument("--manifest", default="", help="Optional path to SHA256SUMS manifest")
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+    args = parser.parse_args(argv)
+
+    root = Path(args.root)
+    manifest = Path(args.manifest) if args.manifest else None
+    errors = audit_workspace(
+        root=root,
+        manifest=manifest,
+        required_paths=args.require_path,
+        forbidden_names=args.forbid_name,
+    )
+
+    if errors:
+        for err in errors:
+            print(f"[AUDIT FAIL] {err}", file=sys.stderr)
+        return 1
+
+    print(f"[AUDIT OK] root={root.resolve()}" + (f" manifest={manifest}" if manifest else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+chmod +x \
+  scripts/run_master_pipeline.sh \
+  scripts/local_workspace_audit.py \
+  scripts/clean_pipeline_guard.py \
+  scripts/package_bundle.py
+
+bash scripts/run_master_pipeline.sh \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --provenance config/provenance.json \
+  --require-path README.md \
+  --forbid-name .DS_Store \
+  --bundle-out build/workspace_bundle.tar.zst
+
+tail -n 5 "${HOME}/.local/state/master_pipeline/pipeline_runs.jsonl"
+pipeline.sh
+
 <div align="center">
 
 # 女娲.skill
